@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"math/rand"
 	"net"
@@ -13,13 +14,6 @@ import (
 
 	"github.com/masterzen/winrm"
 )
-
-// bootstrap reads the full script off stdin and runs it. Sending the script
-// over stdin instead of on the command line avoids the ~8191-char command
-// length limit and keeps quoting sane. $ProgressPreference is silenced so
-// progress bars don't pollute stderr.
-const bootstrap = `$ProgressPreference='SilentlyContinue';` +
-	`$code=[Console]::In.ReadToEnd();Invoke-Expression $code`
 
 // isPortOpen mirrors the Linux tool's dead-host check, against the WinRM port.
 func isPortOpen(host string, port int) bool {
@@ -194,10 +188,46 @@ func runScript(client *winrm.Client, i instance) {
 		body = strings.Join(environCmds, "\n") + "\n" + body
 	}
 
+	body = "$ProgressPreference='SilentlyContinue'\n" + body
+
+	encoded := base64.StdEncoding.EncodeToString([]byte(body))
+	tmpB64 := fmt.Sprintf("C:\\Windows\\Temp\\coord_%d_%s.b64", i.ID, filepath.Base(i.Script))
+
+	// Write base64 chunks via cmd.exe (no PowerShell encoding overhead).
+	chunkSize := 6000
+	for start := 0; start < len(encoded); start += chunkSize {
+		end := start + chunkSize
+		if end > len(encoded) {
+			end = len(encoded)
+		}
+		chunk := encoded[start:end]
+		op := ">>"
+		if start == 0 {
+			op = ">"
+		}
+		writeCmd := fmt.Sprintf("echo %s %s %s", chunk, op, tmpB64)
+		wCtx, wCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, _, _, werr := client.RunWithContextWithString(wCtx, writeCmd, "")
+		wCancel()
+		if werr != nil {
+			Crit(i, "Error writing script chunk:", werr)
+			return
+		}
+	}
+
+	// Decode the base64 temp file, execute it, then clean up
+	execCmd := fmt.Sprintf(
+		"$f='%s';"+
+			"$b64=(Get-Content $f) -join '';"+
+			"Remove-Item -Force $f;"+
+			"$script=[System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64));"+
+			"Invoke-Expression $script",
+		tmpB64)
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	stdout, stderr, code, err := client.RunPSWithContextWithString(ctx, bootstrap, body)
+	stdout, stderr, code, err := client.RunPSWithContextWithString(ctx, execCmd, "")
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			Crit(i, "Script timed out after", timeout)
